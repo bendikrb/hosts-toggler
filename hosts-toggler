@@ -1,0 +1,232 @@
+#!/bin/bash
+# Bendik R. Brenne <bendik@konstant.no> 2017
+# a little tool to manage disabling/enabling entries in the hosts
+# file by grouping them in named groups, using the following syntax:
+#
+# ### <GROUP:[name]> ###
+# 127.0.0.1 example.com
+# [...]
+# 127.0.0.1 example.com
+# ### </GROUP:[name]> ###
+#
+
+# Config
+function set_config {
+  START_PATTERN="### <GROUP\:$group_name> ###"
+  END_PATTERN="### <\/GROUP\:$group_name> ###"
+}
+group_name=""
+hosts_file=/etc/hosts
+hosts_tmp_file="$(mktemp)"
+group_entries="$(mktemp)"
+
+# Flags
+group_disable=""
+quiet="false"
+update="false"
+print_entries="false"
+get_status="false"
+non_interactive="false"
+
+# fancy terminal stuff
+if [ -t 1 ]; then
+    exec 3>&2 2>/dev/null
+    b=$( tput bold ) || true
+    red=$( tput setf 4 ) || true
+    green=$( tput setf 2 ) || true
+    yellow=$( tput setf 6 ) || true
+    t_reset=$( tput sgr0 ) || true
+    exec 2>&3; exec 3>&-
+fi
+
+## Functions
+function print_usage {
+  script=$(basename ${0})
+
+  cat <<EOF
+Enable or disable entries in your hosts file, by named group.
+This script will prompt for a sudo password.
+Usage: $script [-hqnlps] -[e|d] <group_name>
+  -h    This helpful text.
+  -p    Print entries in group and quit.
+  -e|d <name> Enable or disable group
+  -s <name> Get current status for the group (enabled/disabled)
+  -l    List all known groups
+  -n    Non-interactive (sudo)
+  -q    Quiet - only print errors
+
+Examples:
+  $script
+  $script -q -d newspapers
+  $script -p -e newspapers
+  $script -qs newspapers
+  $script -p newspapers
+EOF
+}
+
+function p_err {
+    # print errors
+    # params: <string>
+    local string="${@}"
+    printf "${b:-}${red:-}>>${t_reset:-} %s\n" "${string}"
+}
+
+function p_info {
+    # print info
+    # params: <string>
+    local string="${@}"
+    [[ "${quiet}" == "false" ]] && printf "${b:-}${yellow:-}>>${t_reset:-} %s\n" "${string}"
+}
+
+function check_syntax {
+  local start_tag=$(egrep -soc "^${START_PATTERN}$" "${hosts_file}")
+  local end_tag=$(egrep -soc "^${END_PATTERN}$" "${hosts_file}")
+
+  if [ $start_tag -eq 1 ]; then
+    if [ $end_tag -eq 0 ]; then
+      check="NOT_FOUND"
+    elif [ $end_tag -gt 1 ]; then
+      check="DUPLICATES"
+    else
+      check="OK"
+    fi
+  elif [ $start_tag -eq 0 ]; then
+    check="NOT_FOUND"
+  else
+    check="DUPLICATES"
+  fi
+  
+  [[ $check == "OK" ]] && return 0 || return 1;
+}
+
+function format_entries {
+  check_syntax || {
+    p_err "An error occoured while processesing '${group_name}': $check";
+    return 1;
+  }
+ 
+  # Read all lines between the START and STOP pattern
+  awk "/${START_PATTERN}/{flag=1;next}/${END_PATTERN}/{flag=0}flag" "${hosts_file}" > "${group_entries}"
+
+  #IFS=$'\n'
+  
+  # Only do cleaning/formatting if we're doing an update
+  if [[ "${update}" == "true" ]]; then
+    # Clean every line (remove comments/whitespace)
+    sed -i -e 's/^\([#| ]\)*//' $group_entries
+
+    # Apply comments
+    [[ $group_disable == "true" ]] && sed -i -e 's/^\([^#].*\)/# \1/' $group_entries
+  fi
+
+  group_count=$(cat $group_entries | grep -v -e '^$' | wc -l)
+}
+
+function patch_entries {
+  sudo_params=""
+  $non_interactive && sudo_params="$sudo_params -n"
+  [ -w $hosts_file ] && cmd="nice" || cmd="sudo"
+  
+  # Remove all lines between START and END
+  $cmd sed -i "/^${START_PATTERN}$/,/^${END_PATTERN}$/ {/${START_PATTERN}/n;/${END_PATTERN}/!d}" "${hosts_file}"
+
+  # Insert the newly formatted entries after START
+  $cmd sed -i "/${START_PATTERN}/ r ${group_entries}" "${hosts_file}"
+}
+
+function get_status {
+  disabled_count=$(cat $group_entries | grep -e '^\([#| ]\).*' | grep -v -e '^$' | wc -l)
+  if [[ $disabled_count -eq 0 ]]; then
+    status="enabled"
+  elif [[ $disabled_count -eq $group_count ]]; then
+    status="disabled"
+  else
+    status="mixed"
+  fi
+  
+  echo "${status}"
+  p_info "Total: ${group_count}"
+  p_info "Disabled: ${disabled_count}"
+}
+
+function list_groups {
+  p_info "Groups currently found in ${hosts_file}:"
+  group_names=$(grep -oP "^### \<GROUP\:\K[[:alnum:]-_]+?(?=> ###)" "${hosts_file}" | sort)
+  IFS=$'\n'
+  
+  for name in $group_names; do
+    echo "$name"
+    group_name="${name}"
+    set_config
+    format_entries || {
+      echo -n ""
+    } && {
+      get_status >/dev/null
+      p_info "Status: ${status}"
+      p_info "Entries: ${group_count}"
+    }
+    echo "--"
+  done
+}
+
+while getopts "hqnls:p:d:e:" o
+do
+  case $o in
+    h)
+      print_usage ; exit ;;
+    s)
+      group_name=$OPTARG
+      get_status="true"
+      set_config
+      ;;
+    l)
+      list_groups
+      exit
+      ;;
+    p)
+      # Optional name parameter
+      if [[ $OPTARG =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        group_name=$OPTARG
+        set_config
+      elif [[ $OPTARG =~ ^-. ]]; then
+        let OPTIND=$OPTIND-1
+      fi
+      print_entries="true"
+      ;;
+    q)
+      quiet="true" ;;
+    n)
+      non_interactive="true" ;;
+    d)
+      group_name=$OPTARG
+      group_disable="true"
+      update="true"
+      set_config ;;
+    e)
+      group_name=$OPTARG
+      group_disable="false"
+      update="true"
+      set_config ;;
+  esac
+done
+shift $(($OPTIND-1))
+
+[[ "${group_name}" == "" ]] && { p_err "No group specified!"; print_usage; exit; }
+
+format_entries
+[[ "${get_status}" == "true" ]] && { get_status; exit; }
+[[ "${print_entries}" == "true" ]] && { p_info "GROUP:${group_name} entries (${group_count}):"; cat $group_entries; exit; }
+
+[[ "${update}" != "true" ]] && { p_err "No enable/disable action specified!"; print_usage; exit; }
+
+# Begin patching
+tmp_file=/tmp/hosts.$( date "+%s" )
+cp /etc/hosts $tmp_file
+
+[[ "${group_disable}" == "true" ]] && { p_info "Disabling ${group_count} entries in group ${group_name}..."; }
+[[ "${group_disable}" != "true" ]] && { p_info "Enabling ${group_count} entries in group ${group_name}..."; }
+
+patch_entries
+
+p_info "Done patching ${hosts_file}. A backup can be found here: $tmp_file"
+
